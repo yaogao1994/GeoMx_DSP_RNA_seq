@@ -1,0 +1,935 @@
+---
+title: "Mustika"
+author: "Yao"
+date: "2023-12-10"
+output: html_document
+---
+
+```{r}
+library(NanoStringNCTools)
+library(GeomxTools)
+library(GeoMxWorkflows)
+library(openxlsx)
+library(readxl)
+library(knitr)
+library(dplyr)
+library(ggforce)
+library(ggplot2)
+library(scales)
+library(reshape2)
+library(cowplot)
+library(umap)
+library(Rtsne)
+library(pheatmap)
+library(ggrepel)
+library(ggpubr)
+library(pacman)
+library(ggplot2)
+library(ggiraph)
+library(knitr)
+library(dplyr)
+library(ggforce)
+library(Biobase)
+library(heatmaply)
+```
+
+```{r}
+#Load Data Overall
+Annotation <- read_xlsx("F:/Spatial_seq_raw_data/Gao-072523-394242008/Alldata/annotation/Annotation_Yao_template_myo_only_removed_reorderedforheatmap.xlsx")
+DCCFiles <- paste0(Annotation$Sample_ID, ".dcc")
+DCCFiles <- paste0("F:/Spatial_seq_raw_data/Gao-072523-394242008/Alldata/dccs_myo_only_removed/", DCCFiles)
+PKCFiles <- paste0("F:/Spatial_seq_raw_data/Gao-072523-394242008/Alldata/pkcs/Mm_R_NGS_WTA_v1.0.pkc")
+
+
+
+Yao_alldata <- readNanoStringGeoMxSet(dccFiles = DCCFiles,
+                                      pkcFiles = PKCFiles,
+                                      phenoDataFile="F:/Spatial_seq_raw_data/Gao-072523-394242008/Alldata/annotation/Annotation_Yao_template_myo_only_removed_reorderedforheatmap.xlsx", 
+                                      phenoDataSheet = "Sheet1", 
+                                      phenoDataDccColName = "Sample_ID")
+#saveRDS(Yao_alldata, "F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/Yao_rawdata_myo_removed.rds")
+#Yao_alldata <- readRDS("F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/Yao_rawdata_myo_removed.rds")
+
+
+pkcs <- annotation(Yao_alldata)
+modules <- gsub(".pkc", "", pkcs)
+kable(data.frame(PKCs = pkcs, modules = modules))
+
+
+# Shift counts to one
+Yao_alldata <- shiftCountsOne(Yao_alldata, useDALogic = TRUE)
+
+QC_params <-
+list(minSegmentReads = 10, # Minimum number of reads (1000)
+percentTrimmed = 80, # Minimum % of reads trimmed (80%)
+percentStitched = 80, # Minimum % of reads stitched (80%)
+percentAligned = 80, # Minimum % of reads aligned (80%)
+percentSaturation = 10, # Minimum sequencing saturation (50%)
+minNegativeCount = 1, # Minimum negative control counts (10)
+maxNTCCount = 9000, # Maximum counts observed in NTC well(1000)
+minNuclei = 10, # Minimum # of nuclei estimated (100)
+minArea = 100) # Minimum segment area (5000)
+
+Yao_alldata <- setSegmentQCFlags(Yao_alldata, 
+                      qcCutoffs = QC_params)
+# Collate QC Results
+QCResults <- protocolData(Yao_alldata)[["QCFlags"]]
+flag_columns <- colnames(QCResults)
+QC_Summary <- data.frame(Pass = colSums(!QCResults[, flag_columns]),
+                         Warning = colSums(QCResults[, flag_columns]))
+QCResults$QCStatus <- apply(QCResults, 1L, function(x) {
+    ifelse(sum(x) == 0L, "PASS", "WARNING")
+})
+QC_Summary["TOTAL FLAGS", ] <-
+    c(sum(QCResults[, "QCStatus"] == "PASS"),
+      sum(QCResults[, "QCStatus"] == "WARNING"))
+
+
+col_by <- "Treatment"
+QC_histogram <- function(assay_data = NULL,
+                         annotation = NULL,
+                         fill_by = NULL,
+                         thr = NULL,
+                         scale_trans = NULL) {
+    plt <- ggplot(assay_data,
+                  aes_string(x = paste0("unlist(`", annotation, "`)"),
+                             fill = fill_by)) +
+        geom_histogram(bins = 50) +
+        geom_vline(xintercept = thr, lty = "dashed", color = "black") +
+        theme_bw() + guides(fill = "none") +
+        facet_wrap(as.formula(paste("~", fill_by)), nrow = 4) +
+        labs(x = annotation, y = "Segments, #", title = annotation)
+    if(!is.null(scale_trans)) {
+        plt <- plt +
+            scale_x_continuous(trans = scale_trans)
+    }
+    plt
+}
+
+QC_histogram(sData(Yao_alldata), "Trimmed (%)", col_by, 80)
+QC_histogram(sData(Yao_alldata), "Stitched (%)", col_by, 80)
+QC_histogram(sData(Yao_alldata), "Aligned (%)", col_by, 80)
+QC_histogram(sData(Yao_alldata), "Saturated (%)", col_by, 50) + 
+  labs(title = "Sequencing Saturation (%)", 
+       x = "Sequencing Saturation (%)")
+
+
+# calculate the negative geometric means for each module
+negativeGeoMeans <- 
+  esBy(negativeControlSubset(Yao_alldata), 
+         GROUP = "Module", 
+         FUN = function(x) { 
+             assayDataApply(x, MARGIN = 2, FUN = ngeoMean, elt = "exprs") 
+         }) 
+protocolData(Yao_alldata)[["NegGeoMean"]] <- negativeGeoMeans
+negCols <- paste0("NegGeoMean_", modules)
+pData(Yao_alldata)[, negCols] <- sData(Yao_alldata)[["NegGeoMean"]]
+for(ann in negCols) {
+    plt <- QC_histogram(pData(Yao_alldata), ann, col_by, 2, scale_trans = "log10")
+    print(plt)
+}
+
+# detatch neg_geomean columns ahead of aggregateCounts call
+pData(Yao_alldata) <- pData(Yao_alldata)[, !colnames(pData(Yao_alldata)) %in% negCols]
+
+
+
+kable(QC_Summary, caption = "QC Summary Table for each Segment")
+
+Yao_alldata_1 <- Yao_alldata[, QCResults$QCStatus == "PASS"]
+
+# Subsetting our dataset has removed samples which did not pass QC
+dim(Yao_alldata_1)
+
+
+# Generally keep the qcCutoffs parameters unchanged. Set removeLocalOutliers to 
+# FALSE if you do not want to remove local outliers
+Yao_alldata_1 <- setBioProbeQCFlags(Yao_alldata_1, 
+                               qcCutoffs = list(minProbeRatio = 0.1,
+                                                percentFailGrubbs = 20), 
+                               removeLocalOutliers = TRUE)
+
+ProbeQCResults <- fData(Yao_alldata_1)[["QCFlags"]]
+
+# Define QC table for Probe QC
+qc_df <- data.frame(Passed = sum(rowSums(ProbeQCResults[, -1]) == 0),
+                    Global = sum(ProbeQCResults$GlobalGrubbsOutlier),
+                    Local = sum(rowSums(ProbeQCResults[, -2:-1]) > 0
+                                & !ProbeQCResults$GlobalGrubbsOutlier))
+
+
+#Subset object to exclude all that did not pass Ratio & Global testing
+ProbeQCPassed <- 
+    subset(Yao_alldata_1, 
+           fData(Yao_alldata_1)[["QCFlags"]][,c("LowProbeRatio")] == FALSE &
+               fData(Yao_alldata_1)[["QCFlags"]][,c("GlobalGrubbsOutlier")] == FALSE)
+dim(ProbeQCPassed)
+#> Features  Samples 
+#>    18641      229
+Yao_alldata_1 <- ProbeQCPassed 
+
+# Check how many unique targets the object has
+length(unique(featureData(Yao_alldata_1)[["TargetName"]]))
+#> [1] 18504
+
+# collapse to targets
+Yao_alldata_1 <- aggregateCounts(Yao_alldata_1)
+dim(Yao_alldata_1)
+#> Features  Samples 
+#>    18504      229
+exprs(Yao_alldata_1)[1:5, 1:2]
+
+# Define LOQ SD threshold and minimum value
+cutoff <- 2
+minLOQ <- 2
+
+# Calculate LOQ per module tested
+LOQ <- data.frame(row.names = colnames(Yao_alldata_1))
+for(module in modules) {
+    vars <- paste0(c("NegGeoMean_", "NegGeoSD_"),
+                   module)
+    if(all(vars[1:2] %in% colnames(pData(Yao_alldata_1)))) {
+        LOQ[, module] <-
+            pmax(minLOQ,
+                 pData(Yao_alldata_1)[, vars[1]] * 
+                     pData(Yao_alldata_1)[, vars[2]] ^ cutoff)
+    }
+}
+pData(Yao_alldata_1)$LOQ <- LOQ
+
+LOQ_Mat <- c()
+for(module in modules) {
+    ind <- fData(Yao_alldata_1)$Module == module
+    Mat_i <- t(esApply(Yao_alldata_1[ind, ], MARGIN = 1,
+                       FUN = function(x) {
+                           x > LOQ[, module]
+                       }))
+    LOQ_Mat <- rbind(LOQ_Mat, Mat_i)
+}
+# ensure ordering since this is stored outside of the geomxSet
+LOQ_Mat <- LOQ_Mat[fData(Yao_alldata_1)$TargetName, ]
+#saveRDS(Yao_alldata_1, "F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/2nd_attempt/Yao_QCdata.rds")
+#Yao_alldata_1 <- readRDS("F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/2nd_attempt/Yao_QCdata.rds")
+
+# Save detection rate information to pheno data
+pData(Yao_alldata_1)$GenesDetected <- 
+    colSums(LOQ_Mat, na.rm = TRUE)
+pData(Yao_alldata_1)$GeneDetectionRate <-
+    pData(Yao_alldata_1)$GenesDetected / nrow(Yao_alldata_1)
+
+# Determine detection thresholds: 1%, 5%, 10%, 15%, >15%
+pData(Yao_alldata_1)$DetectionThreshold <- 
+    cut(pData(Yao_alldata_1)$GeneDetectionRate,
+        breaks = c(0, 0.01, 0.05, 0.1, 0.15, 1),
+        labels = c("<1%", "1-5%", "5-10%", "10-15%", ">15%"))
+
+
+Yao_alldata_1 <-
+    Yao_alldata_1[, pData(Yao_alldata_1)$GeneDetectionRate >= 0]
+
+
+count_mat <- count(pData(Yao_alldata_1), `Treatment`, 'segment', 'Slide Name')
+
+test_gr <- gather_set_data(count_mat, 1:3)
+test_gr$x <-
+    factor(test_gr$x,
+           levels = c("Treatment", "segment", "Slide Name"))
+
+# Calculate detection rate:
+LOQ_Mat <- LOQ_Mat[, colnames(Yao_alldata_1)]
+fData(Yao_alldata_1)$DetectedSegments <- rowSums(LOQ_Mat, na.rm = TRUE)
+fData(Yao_alldata_1)$DetectionRate <-
+    fData(Yao_alldata_1)$DetectedSegments / nrow(pData(Yao_alldata_1))
+
+# Gene of interest detection table
+goi <- c("Myf5", "Myod1", "Myog", "Pax3", "Lbx1", "Pitx2",
+         "Met", "Cxcr4", "Fgfr1", "SDF1", "HGF")
+goi_df <- data.frame(
+    Gene = goi,
+    Number = fData(Yao_alldata_1)[goi, "DetectedSegments"],
+    DetectionRate = percent(fData(Yao_alldata_1)[goi, "DetectionRate"]))
+
+
+# Plot detection rate:
+plot_detect <- data.frame(Freq = c(1, 5, 10, 20, 30, 50))
+plot_detect$Number <-
+    unlist(lapply(c(0.01, 0.05, 0.1, 0.2, 0.3, 0.5),
+                  function(x) {sum(fData(Yao_alldata_1)$DetectionRate >= x)}))
+plot_detect$Rate <- plot_detect$Number / nrow(fData(Yao_alldata_1))
+rownames(plot_detect) <- plot_detect$Freq
+
+ggplot(plot_detect, aes(x = as.factor(Freq), y = Rate, fill = Rate)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = formatC(Number, format = "d", big.mark = ",")),
+              vjust = 1.6, color = "black", size = 4) +
+    scale_fill_gradient2(low = "orange2", mid = "lightblue",
+                         high = "dodgerblue3", midpoint = 0.65,
+                         limits = c(0,1),
+                         labels = scales::percent) +
+    theme_bw() +
+    scale_y_continuous(labels = scales::percent, limits = c(0,1),
+                       expand = expansion(mult = c(0, 0))) +
+    labs(x = "% of Segments",
+         y = "Genes Detected, % of Panel > LOQ")
+
+# Subset to target genes detected in at least 10% of the samples.
+#   Also manually include the negative control probe, for downstream use
+negativeProbefData <- subset(fData(Yao_alldata_1), CodeClass == "Negative")
+neg_probes <- unique(negativeProbefData$TargetName)
+Yao_alldata_1 <- 
+    Yao_alldata_1[fData(Yao_alldata_1)$DetectionRate >= 0.1 |
+                        fData(Yao_alldata_1)$TargetName %in% neg_probes, ]
+dim(Yao_alldata_1)
+#> Features  Samples 
+#>    10131      221
+
+# retain only detected genes of interest
+goi <- goi[goi %in% rownames(Yao_alldata_1)]
+#saveRDS(Yao_alldata_1, "F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/2nd_attempt/Yao_prenorm.rds")
+#Yao_alldata_1 <- readRDS("F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/2nd_attempt/Yao_prenorm.rds")
+
+Yao_alldata_1 <- normalize(Yao_alldata_1 ,
+                             norm_method = "quant", 
+                             desiredQuantile = .75,
+                             toElt = "q_norm")
+
+saveRDS(Yao_alldata_1, "F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/reordered/Yao_myo_removed_reordered_for_heatmap_normed.rds")
+Yao_alldata_1 <- readRDS("E:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/Yao_myo_removed_normdata.rds")
+
+boxplot(exprs(Yao_alldata_1)[,1:10],
+        col = "#9EDAE5", main = "Raw Counts",
+        log = "y", names = 1:10, xlab = "Segment",
+        ylab = "Counts, Raw")
+
+boxplot(assayDataElement(Yao_alldata_1[,1:10], elt = "q_norm"),
+        col = "#2CA02C", main = "Q3 Norm Counts",
+        log = "y", names = 1:10, xlab = "Segment",
+        ylab = "Counts, Q3 Normalized")
+
+
+all_normdata <- Yao_alldata_1@assayData[["q_norm"]]
+write.table(all_normdata, sep = ",", "F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/raw_data_norm_final_version.csv")   
+
+
+#a <- Yao_alldata_1@assayData[["q_norm"]]
+#write.csv(a, "F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/raw_data_norm.csv")
+```
+
+#UMAP
+```{r}
+# update defaults for umap to contain a stable random_state (seed)
+custom_umap <- umap::umap.defaults
+custom_umap$random_state <- 42
+# run UMAP
+umap_out <-
+    umap(t(log2(assayDataElement(Yao_alldata_1 , elt = "q_norm"))),  
+         config = custom_umap)
+pData(Yao_alldata_1)[, c("UMAP1", "UMAP2")] <- umap_out$layout[, c(1,2)]
+
+ggplot(pData(Yao_alldata_1),
+       aes(x = UMAP1, y = UMAP2, color = Treatment, shape = segment)) +
+    geom_point(size = 7) +
+    theme_bw()
+
+#ggsave2("F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/figure/UMAP_myo_removed_1.tiff", width= 10, height=8, units = c("in"), dpi = 300)
+ggsave2("D:/Dropbox/Dropbox/Yao Gao/Publication/International_journal_of_molecular_science/1st_attemp/fig/revisedFig2A_point7.tiff", width= 10, height=8, units = c("in"), dpi = 300)
+```
+
+
+#tsne
+```{r}
+# run tSNE
+set.seed(42) # set the seed for tSNE as well
+tsne_out <-
+    Rtsne(t(log2(assayDataElement(Yao_alldata_1 , elt = "q_norm"))),
+          perplexity = ncol(Yao_alldata_1)*.15)
+pData(Yao_alldata_1)[, c("tSNE1", "tSNE2")] <- tsne_out$Y[, c(1,2)]
+ggplot(pData(Yao_alldata_1),
+       aes(x = tSNE1, y = tSNE2, color = segment , shape = Treatment)) +
+    geom_point(size = 3) +
+    theme_bw()
+```
+
+
+#Clustering high CV Genes
+```{r}
+# create a log2 transform of the data for analysis
+assayDataElement(object = Yao_alldata_1, elt = "log_q") <-
+    assayDataApply(Yao_alldata_1, 2, FUN = log, base = 2, elt = "q_norm")
+
+# create CV function
+calc_CV <- function(x) {sd(x) / mean(x)}
+CV_dat <- assayDataApply(Yao_alldata_1,
+                         elt = "log_q", MARGIN = 1, calc_CV)
+# show the highest CD genes and their CV values
+sort(CV_dat, decreasing = TRUE)[1:5]
+
+
+# Identify genes in the top 3rd of the CV values
+GOI <- names(CV_dat)[CV_dat > quantile(CV_dat, 0.8)]
+pheatmap(assayDataElement(Yao_alldata_1[GOI, ], elt = "log_q"),
+         scale = "row", 
+         show_rownames = FALSE, show_colnames = FALSE,
+         border_color = NA,
+         clustering_method = "average",
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         breaks = seq(-3, 3, 0.05),
+         color = colorRampPalette(c("purple3", "black", "yellow2"))(120),
+         annotation_col = 
+             pData(Yao_alldata_1)[, c("segment", "Treatment")])
+
+
+GOI_1 <- c("Acadm", "Acta1", "Actc1", "Actg1", "Actn2", "Actn3", "Actn4", "Acvr1", "Adamts15", "Adamts5", "Afg3l2", "Agtr2", "Akap13", "Akap6", "Akt1", "Alpk3", "Ank2", "Ankrd17", "Aplnr", "Arrb2", "Atg7", "AW551984", "Barx2", "Bcl2", "Bcl9", "Bin1", "Bin3", "Bmp2", "Bmp4", "Bmpr1a", "Bmpr2", "Cacna1s", "Camk1", "Camk2d", "Capn2", "Casq2", "Ccn4", "Ccnd2", "Cd81", "Cd9", "Cdh2", "Cdk9", "Cdon", "Cfl2", "Chrnb1", "Chuk", "Col14a1", "Csrp3", "Ctdp1", "Ctnnb1", "Cxadr", "Cxcl12", "Daxx", "Dmpk", "Dock1", "Dyrk1b", "Dysf", "Ednra", "Ednrb", "Efemp2", "Efnb2", "Ehd1", "Ehd2", "Ep300", "Fdps", "Fgf9", "Fgfr2", "Fkrp", "Fktn", "Flii", "Flnc", "Foxp1", "Frs2", "G6pd2", "G6pdx", "Glmn", "Gsk3a", "Gsk3b", "H3f3a", "H3f3b", "Hacd1", "Hand2", "Hdac2", "Hdac4", "Hdac5", "Hdgfl2", "Hes1", "Homer1", "Id2", "Ift88", "Igf1", "Igf2", "Igfbp5", "Isl1", "Itga8", "Itgb1", "Kdm6b", "Kit", "Klhl40", "Klhl41", "Kras", "Krt8", "Lamb1", "Lamb2", "Lamc1", "Large1", "Lmna", "Lmod3", "Lox", "Maml1", "Mamstr", "Map2k4", "Mapk14", "Mdm2", "Mecp2", "Mef2a", "Mef2c", "Megf10", "Meis1", "Met", "Mfn2", "Mmp14", "Mrtfa", "Mtor", "Myc", "Myh10", "Myh7", "Myh9", "Myl9", "Mylk2", "Mymk", "Mymx", "Myo18b", "Myod1", "Myof", "Myog", "Myom2", "Myoz2", "Neb", "Neo1", "Nfatc1", "Nfatc4", "Nid1", "Ninj1", "Notch1", "Npnt", "Nr3c1", "Nrg1", "Ntf3", "Ntn3", "Olfm2", "Parp2", "Pbrm1", "Pdcd4", "Pdgfb", "Pdgfra", "Pdgfrb", "Pdlim5", "Pgm5", "Pias1", "Piezo1", "Pin1", "Pitx2", "Pld3", "Plec", "Pmp22", "Popdc2", "Ppp3ca", "Prickle1", "Prkar1a", "Prkd1", "Prok2", "Ptgfrn", "Rarb", "Rbm10", "Rbm24", "Rbm38", "Rbm4", "Rbpj", "Rcan1", "Rxra", "Rxrb", "Selenon", "Setd3", "Sgcb", "Sgcd", "Shox2", "Sik1", "Sirt1", "Sirt6", "Six1", "Six4", "Ski", "Slc25a4", "Slc8a1", "Slc9a1", "Smad1", "Smad6", "Smarca2", "Smarcd3", "Smo", "Smyd1", "Sod2", "Sorbs2", "Sort1", "Sox6", "Spag9", "Speg", "Spg11", "Srf", "Stac3", "Stim1", "Supt6", "Svil", "Syne1", "Synpo2l", "Tarbp2", "Tbx1", "Tbx2", "Tbx3", "Tcap", "Tgfb1", "Tmem119", "Tmod1", "Tmod2", "Tmod3", "Tmsb4x", "Tmtc3", "Tnnt1", "Tnnt2", "Tnnt3", "Tnpo2", "Tpm1", "Trim32", "Trim72", "Trip10", "Tshz3", "Ttn", "Uchl1", "Vangl2", "Vegfa", "Wfikkn2", "Wt1", "Xbp1", "Yy1", "Zbed6", "Zeb1", "Znhit1", "Pax3", "Pax7", "Mest", "Myf5", "Myod1")
+
+
+
+a<- pheatmap(assayDataElement(Yao_alldata_1[GOI_1, ], elt = "q_norm"),
+         scale = "row", 
+         cluster_row=FALSE,
+         cluster_cols=FALSE,
+         show_rownames = FALSE, show_colnames = FALSE,
+         border_color = NA,
+         clustering_method = "complete",
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         breaks = seq(-3, 3, 0.05),
+         color = colorRampPalette(c("purple3", "black", "yellow2"))(120),
+         annotation_col = 
+             pData(Yao_alldata_1)[, c("segment", "Treatment")])
+
+save_pheatmap_pdf <- function(x, filename, width=7, height=10) {
+   stopifnot(!missing(x))
+   stopifnot(!missing(filename))
+   pdf(filename, width=width, height=height)
+   grid::grid.newpage()
+   grid::grid.draw(x$gtable)
+   dev.off()
+}
+save_pheatmap_pdf(a, "F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/reordered/figure/heatmap1_myogenesis.pdf")
+
+GOI_1 <- c("Ager", "Akirin1", "Arpc5", "Bcl2", "Bin3", "Bmpr1a", "Camk2d", "Cav1", "Ccn4", "Coro1b", "Crk", "Ddit3", "Ddr1", "Ddr2", "Dock4", "Egfl7", "Egr1", "F3", "Fgf9", "Gna12", "Gna13", "Grb10", "Gstp1", "Hdac4", "Igf1", "Igfbp3", "Igfbp5", "Il18", "Il6st", "Ilk", "Iqgap1", "Itga4", "Itgb1bp1", "Lrp1", "Map3k7", "Mdk", "Mdm2", "Mef2c", "Megf10", "Met", "Myc", "Myh9", "Myo5a", "Net1", "Nf1", "Nfe2l2", "Park7", "Parva", "Pcsk5", "Pdgfa", "Pdgfb", "Pdgfrb", "Plat", "Plau", "Plxna1", "Postn", "Ppard", "Ppargc1a", "Prkg1", "Rapgef3", "Rhoa", "Rock1", "Rps6kb1", "S100a11", "S1pr2", "Six1", "Six4", "Slit2", "Smo", "Src", "Ssh1", "Stat5b", "Tafa5", "Tert", "Tmsb4x", "Tpm1", "Trib1") 
+
+GOI_1 <- c("Pax3", "Gab1", "CDC42", "Mmp2", "Ptk2", "Pxn", "Vcl", "Tln1", "Tln2", "Arpc1a", "Arpc1b", "Arpc2")
+
+pheatmap(assayDataElement(Yao_alldata_1[GOI_1, ], elt = "q_norm"),
+         scale = "row", 
+         cluster_row=FALSE,
+         cluster_cols=FALSE,
+         show_rownames = FALSE, show_colnames = FALSE,
+         border_color = NA,
+         clustering_method = "complete",
+         clustering_distance_rows = "correlation",
+         clustering_distance_cols = "correlation",
+         breaks = seq(-3, 3, 0.05),
+         color = colorRampPalette(c("purple3", "black", "yellow2"))(120),
+         annotation_col = 
+             pData(Yao_alldata_1)[, c("segment", "Treatment")])
+
+
+save_pheatmap_pdf <- function(x, filename, width=7, height=10) {
+   stopifnot(!missing(x))
+   stopifnot(!missing(filename))
+   pdf(filename, width=width, height=height)
+   grid::grid.newpage()
+   grid::grid.draw(x$gtable)
+   dev.off()
+}
+save_pheatmap_pdf(a, "F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/reordered/figure/heatmap1_migration.pdf")
+
+
+
+
+
+GOI_1 <- c("Pitx1", "Pitx2", "Myf5", "Pax3", "Pax7", "Myog")
+pheatmap(assayDataElement(Yao_alldata_1[GOI_1, ], elt = "q_norm"),
+         color = colorRampPalette(c("purple3", "black", "yellow2"))(120),
+         annotation_col = 
+             pData(Yao_alldata_1)[, c("segment", "Treatment")])
+
+
+heatmaply(assayDataElement(Yao_alldata_1[GOI_1, ], elt = "q_norm"), 
+        dendrogram = "none",
+        xlab = "", ylab = "", 
+        main = "",
+        scale = "row",
+        margins = c(60,100,40,20),
+        grid_color = "white",
+        grid_width = 0.00001,
+        titleX = FALSE,
+        hide_colorbar = TRUE,
+        branches_lwd = 0.1,
+        label_names = c("Country", "Feature:", "Value"),
+        fontsize_row = 5, fontsize_col = 5,
+        heatmap_layers = theme(axis.line=element_blank())
+        )
+```
+#Differential Expression
+#When comparing features that co-exist in a given tissue section (e.g. glomeruli vs tubules in DKD kidneys), a random slope is included in the LMM model. When comparing features that are mutually exclusive in a given tissue section (healthy glomeruli versus DKD glomeruli) the LMM model does not require a random slope.
+#In my case, when comparing the different ROIs in the same section, random slope should be included in the LMM model; when comparing the same ROIs from CT and HFD group, LMM model does not require a random slope
+
+
+#First, let's compare the DEGs among different ROIs (A-G) in CT group, random slope should be included
+#so-called within slide analysis
+#If multiple tissues are placed per slide, we would change the intercept variable to the unique tissue name (ex: tissue name, Block ID, etc).
+```{r}
+#HFD <- subset(Yao_alldata_1, Yao_alldata_1@phenoData$data$Treatment == 'HFD')
+#write.csv(HFD, "F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/2nd_attempt/figure/test.csv")
+
+#pData(Yao_alldata_1)$test <- 
+#    factor(pData(Yao_alldata_1)$ROI_name, c("A", "B", "C", "D", "E", "F", "G"))
+
+#pData(Yao_alldata_1)[["uniqueID"]] <- 
+#    factor(pData(Yao_alldata_1)[["ROI_ID"]])
+
+```
+
+
+#within slide analysis: A:B:C:D:E:F
+```{r}
+# convert test variables to factors
+pData(Yao_alldata_1)$segment <- 
+    factor(pData(Yao_alldata_1)[["segment"]])
+pData(Yao_alldata_1)$Treatment <- 
+    factor(pData(Yao_alldata_1)[["Treatment"]])
+pData(Yao_alldata_1)$Uniqetissue <- 
+    factor(pData(Yao_alldata_1)[["Uniqetissue"]])
+assayDataElement(object = Yao_alldata_1, elt = "log_q") <-
+    assayDataApply(Yao_alldata_1, 2, FUN = log, base = 2, elt = "q_norm")
+
+# run LMM:
+# formula follows conventions defined by the lme4 package
+
+
+    mixedOutmc_ws <-
+        mixedModelDE(Yao_alldata_1,
+                     elt = "q_norm",
+                     modelFormula = ~ segment+(1+segment|Uniqetissue),
+                     groupVar = "segment",
+                     nCores = parallel::detectCores(),
+                     multiCore = FALSE)
+    
+
+    
+    
+
+
+```
+
+```{r}
+#create a dataframe of the DEG results
+results_ws <- c()
+results_ws <- 
+  do.call(
+  rbind,
+  mixedOutmc_ws["lsmeans", ]
+  )
+
+tests <-
+  rownames(results_ws)
+
+results_ws <- as.data.frame(results_ws)
+
+results_ws$Comparison <- tests
+
+rm(test)
+
+results_ws$Gene <- unlist(lapply(
+  colnames(mixedOutmc_ws),
+  rep,
+  nrow(mixedOutmc_ws["lsmeans", ][[1]])
+  ))
+
+results_ws$FC <- 
+  exp(results_ws$Estimate)
+
+results_ws <-
+  results_ws[, c("Gene", "Comparison", "Estimate", "FC", "Pr(>|t|)")]
+
+colnames(results_ws) <-
+  c("Gene", "Comparison", "Log2FC", "Fold Change", "p-value")
+
+results_ws <- results_ws[order(results_ws$Gene),]
+
+rownames(results_ws) <- NULL
+
+
+DEGs_ws <- subset(results_ws, results_ws$`p-value` < 0.05)
+
+write.csv(results_ws, "F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/AllDEGresults_ws_myo_segment_ABCDE_removed.csv")
+saveRDS(results_ws, "F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/myo_segment_allDEG_genelist_removed.rds")
+write.csv(DEGs_ws, "F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/significantDEGlist_myo_segment_ABCDE_removed.csv")
+saveRDS(DEGs_ws, "F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/significantDEGlist_myoABCDE_ws_removed.rds")
+
+#To subset the DEGlist of A-B
+A_B <- subset(results_ws, results_ws$Comparison == "A - B")
+
+#To subset the up and down regulated gene in A-B
+A_B_up <- subset(A_B,A_B$Log2FC > 2)
+A_B_down <- subset(A_B,A_B$Log2FC < -2)
+
+```
+
+
+#Alternatively, let's compare the DEGs between same ROIs from CT and HFD groups, random slope should be included
+#so-called between slide analysis, since one slide represent one treatment
+#First let focus on ROI A, which is the limb bud tip. 
+```{r}
+# convert test variables to factors
+pData(Yao_alldata_1)$Biological_replicate <-
+    factor(pData(Yao_alldata_1)$Biological_replicate, c("1", "2", "3"))
+pData(Yao_alldata_1)$Technical_replicate <-
+    factor(pData(Yao_alldata_1)$Technical_replicate, c("1", "2"))
+pData(Yao_alldata_1)$segment <- 
+    factor(pData(Yao_alldata_1)[["segment"]])
+pData(Yao_alldata_1)$Treatment <- 
+    factor(pData(Yao_alldata_1)[["Treatment"]])
+pData(Yao_alldata_1)$Uniqetissue <- 
+    factor(pData(Yao_alldata_1)[["Uniqetissue"]])
+assayDataElement(object = Yao_alldata_1, elt = "log_q") <-
+    assayDataApply(Yao_alldata_1, 2, FUN = log, base = 2, elt = "q_norm")
+
+
+assayDataElement(object = Yao_alldata_1, elt = "log_q") <-
+    assayDataApply(Yao_alldata_1, 2, FUN = log, base = 2, elt = "q_norm")
+
+
+# run LMM: A common statistical approach is to use a linear mixed-effect model (LMM) to get the DEGs. 
+# formula follows conventions defined by the lme4 package
+
+    mixedOutmc_bs <-
+        mixedModelDE(Yao_alldata_1,
+                     elt = "q_norm",
+                     modelFormula =~Treatment + (1 | Uniqetissue),
+                     groupVar = "Treatment",
+                     nCores = parallel::detectCores(),
+                     multiCore = FALSE)
+    
+
+```
+
+```{r}
+#create a dataframe of the DEG results
+results_bs <- c()
+results_bs <- 
+  do.call(
+  rbind,
+  mixedOutmc_bs["lsmeans", ]
+  )
+
+tests <-
+  rownames(results_bs)
+
+results_bs <- as.data.frame(results_bs)
+
+results_bs$Comparison <- tests
+
+rm(test)
+
+results_bs$Gene <- unlist(lapply(
+  colnames(mixedOutmc_bs),
+  rep,
+  nrow(mixedOutmc_bs["lsmeans", ][[1]])
+  ))
+
+results_bs$FC <- 
+  exp(results_bs$Estimate)
+
+results_bs <-
+  results_bs[, c("Gene", "Comparison", "Estimate", "FC", "Pr(>|t|)")]
+
+colnames(results_bs) <-
+  c("Gene", "Comparison", "Log2FC", "Fold Change", "p-value")
+
+results_bs <- results_bs[order(results_bs$Gene),]
+
+rownames(results_bs) <- NULL
+
+
+
+DEGs_bs <- subset(results_bs, results_bs$`p-value` < 0.05)
+
+write.csv(results_bs, "F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/AllDEGresults_HFD_CT_bs.csv")
+saveRDS(results_bs, "F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/AllDEGlist_HFD_CT_bs.rds")
+write.csv(DEGs_bs, "F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/significantDEGlist_CT_HFD_comparison_bs.csv")
+saveRDS(DEGs_bs, "F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/significantDEGlist_HFD_CT_bs.rds")
+
+#CT_HFD_down <- subset(`results`, `results`$Log2FC > 2)
+#CT_HFD_up <- subset(`results`,`results`$Log2FC < -2)
+```
+
+
+
+
+
+
+
+#####Volcano plots of DEG results
+```{r}
+results_bs <- readRDS("E:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/AllDEGlist_HFD_CT_bs.rds")
+results_bs$Color <- "NS"
+results_bs$Color[results_bs$'p-value' < 0.05] <- "p < 0.05"
+results_bs$Color <- 
+  factor(results_bs$Color,
+  levels = c("NS", "p < 0.05")
+  )
+results_bs <- subset(results_bs, results_bs$Log2FC < 10 & Log2FC > -10)
+##CT - HFD comparison
+DEGs_bs <- readRDS("E:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/significantDEGlist_HFD_CT_bs.rds")
+upregulated <- subset(DEGs_bs, DEGs_bs$Log2FC < 5 & Log2FC >0)
+downregulated <- subset(DEGs_bs, DEGs_bs$Log2FC < 0 & Log2FC > -5)
+
+#For specific significant genes of each group
+#sig_genes <- results_bs %>% 
+#  filter(Gene %in% c("Pax3", "Pax7", "Myf5", "Myog", "Myod1", "Met", "Pitx1", "Pitx2", "Gab1", "Epha4"))
+#down_sig_genes <- results_bs %>%
+#  filter(Gene %in% c("Khsrp"))
+#up_sig_genes <- results_bs %>%
+#  filter(Gene %in% c("Col1a1", "Tnnt1", "Pitx1", "Dlk1", "Myh3", "", "Myod1", "Myo18b"))
+
+
+#For all genes within the top 15 of each group
+top_up <- 
+  upregulated[order(upregulated$Log2FC, decreasing = TRUE),]
+top_up <- top_up$Gene[1:15]
+top_down <- downregulated[order(downregulated$Log2FC, decreasing = FALSE),]
+top_down <- top_down$Gene[1:15]
+
+ggplot(
+  results_bs,
+  aes(x = Log2FC,
+      y = -log10(`p-value`),
+      color = Color,
+      label = Gene)) +
+  geom_vline(xintercept = c(0.5, -0.5),
+             lty = "dashed" ) +
+geom_hline(yintercept = -log10(0.05),
+           lty = "dashed") +
+geom_point() + 
+  labs(x = "Differential Expression (log2FC)",
+       y = "-log10(p-value)",
+       color = "Significance") +
+  scale_color_manual(values = c(`p < 0.05` = "dodgerblue", `NS` = "gray"),
+                     guide = guide_legend(override.aes = list(size = 4))) +
+  scale_y_continuous(expand = expansion(mult = c(0,0.05))) +
+  xlim(-15, 15) +
+  theme_bw(base_size = 30) +
+  theme(legend.position = "bottom")
+
+ggsave2("D:/Dropbox/Dropbox/Yao Gao/Publication/International_journal_of_molecular_science/1st_attemp/fig/revisedFig2B_log2FC10.tiff", width=10, height=10, units = c("in"), dpi = 300)
+
+annotate("text", x=-50, y=1.4, label="p=0.05")
+geom_text_repel(data = subset(results_bs, Gene %in% c(top_up, top_down)),
+                size = 3,point.padding = 0.15,
+                color = "black",
+                min.segment.length = .1,
+                box.padding = .2,
+                lwd = 2,
+                max.overlaps = 50) 
+#rm(top_down, top_up, upregulated, downregulated)
+```
+
+##plot gene of interest
+##Pro-migration: Pitx1, Pitx2, Meox2;Msx1; Six2
+##Anti-migration: ID1, ID2, ID3, HEY1, MSC, HES1 
+
+##color:  CT:#009E73    HFD: #D55E00
+##A:grey80  B:steelblue3, C: chartreuse, D: blue4, E: #009999
+```{r}
+library(Biobase)
+
+gene <- c("Myh3")
+
+df <- pData(Yao_alldata_1)
+
+df$gene_expr <-
+  t(as.data.frame(
+    assayDataElement(
+      Yao_alldata_1[gene, ],
+      elt = "q_norm")))
+
+ggbarplot(
+  df,
+  x = "Treatment",     #specify variable    Treatment  or  segment
+  y = "gene_expr",
+  add = c("mean_se"), #, "jitter"),
+  size= 0.1,
+  fill = "Treatment",     #specify variable    Treatment  or  segment
+  palette = alpha(c("#009E73", "#D55E00"), 0.7),
+  order = c("CT", "HFD"),
+  select = c("CT", "HFD"),
+  facet.by="segment",
+  nrow=1,
+  ncol=5) +      ##splite different segment
+  theme(legend.position = "none") +
+  labs(y = paste(gene,  sep = " "),
+       x = element_blank())+
+   theme(axis.title.x = element_text(size = 40,face="bold"),
+         axis.text.x = element_text(size = 20),
+        axis.title.y = element_text(size = 40))
+
+
+ggsave2("F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/figure/barplot_Myh3_CT_HFD.tiff", width=10, height=5, units = c("in"), dpi = 300)
+```
+
+
+###comparision between segments ABCDE
+```{r}
+gene <- c("Myog")
+
+df <- pData(Yao_alldata_1)
+
+df$gene_expr <-
+  t(as.data.frame(
+    assayDataElement(
+      Yao_alldata_1[gene, ],
+      elt = "q_norm")))
+
+ggbarplot(
+  df,
+  x = "segment",     #specify variable    Treatment  or  segment
+  y = "gene_expr",
+  add = c("mean"),
+  size= 0.1,
+  fill = "Treatment",     #specify variable    Treatment  or  segment
+  palette = alpha(c("#009E73", "#D55E00"), 0.7),
+  order = c("A", "B", "C", "D", "E"),
+  select = c("A", "B", "C", "D", "E"),
+  nrow=1,
+  ncol=5) +      ##splite different segment
+  theme(legend.position = "none") +
+  labs(y = paste(gene, "Expression", sep = " "),
+       x = element_blank())+
+   theme(axis.title.x = element_text(size = 50,face="bold"),
+         axis.text.x = element_text(size = 20),
+        axis.title.y = element_text(size = 25))
+
+ggsave2("F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/figure/barplot_Myog_ABCDE.tiff", width=10, height=5, units = c("in"), dpi = 300)
+```
+
+
+#Violin plot
+#http://www.sthda.com/english/wiki/ggplot2-violin-plot-quick-start-guide-r-software-and-data-visualization
+```{r}
+gene <- c("Meox2")
+
+df <- pData(Yao_alldata_1)
+
+
+df$gene_expr <-
+  t(as.data.frame(
+    assayDataElement(
+      Yao_alldata_1[gene, ],
+      elt = "q_norm")))
+
+
+p <- ggplot(df, aes(x=Treatment, y=df$gene_expr)) + 
+  geom_violin()
+p
+
+# Rotate the violin plot
+p + coord_flip()
+# Set trim argument to FALSE
+ggplot(df, aes(x=Treatment, y=df$gene_expr), facet.by="segment") + 
+  geom_violin(trim=FALSE)
+
+p + scale_x_discrete(limits=c("CT", "HFD"))
+ 
+
+p<-ggplot(df, aes(x=Treatment, y=df$gene_expr, color=segment)) +
+  geom_violin(trim=TRUE)
+p
+```
+
+
+
+#Gene Ontology
+```{r}
+#if (!require("BiocManager", quietly = TRUE))
+#  install.packages("BiocManager")
+
+#BiocManager::install("clusterProfiler")
+library(clusterProfiler)
+#BiocManager::install("org.Mm.eg.db")
+library(org.Mm.eg.db)
+library(enrichplot)
+library(DOSE)
+```
+
+```{r}
+HFD_up <- subset(`results_bs`, `results_bs`$Log2FC < -2)
+HFD_down <- subset(`results_bs`,`results_bs`$Log2FC > 2)
+
+UpGeneOnt_BP <-
+enrichGO(
+gene = HFD_up$Gene,
+OrgDb = "org.Mm.eg.db",
+keyType = "SYMBOL",
+ont = "BP")
+
+dotplot(UpGeneOnt_BP, showCategory=30)
+ggsave2("F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/figure/GO_up_in_HFD_BP.tiff", width=15, height=15, units = c("in"), dpi = 300)
+#barplot(UpGeneOnt_BP,showCategory = 20) + scale_fill_gradient(low = "grey30",
+#high = "grey90",name = "adjusted p-value") +
+#theme_bw(base_size = 15)
+
+DownGeneOnt_BP <-
+enrichGO(
+gene = HFD_down$Gene,
+OrgDb = "org.Mm.eg.db",
+keyType = "SYMBOL",
+ont = "BP")
+
+dotplot(DownGeneOnt_BP, showCategory=c("muscle cell differentiation", "ameboidal-type cell migration", "muscle cell migration", "positive regulation of GTPase activity", "small GTPase mediated signal transduction", "extracellular matrix organization", "limb morphogenesis", "limb development", "contractile actin filament bundle assembly", "actin polymerization or depolymerization", "Rho protein signal transduction", "cellular response to extracellular stimulus"),
+        font.size=20)
+
+
+
+
+
+
+ggsave2("F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/figure/GO_down_in_HFD_BP.tiff", width=10, height=10, units = c("in"), dpi = 300)
+#write.csv(DownGeneOnt_BP, "F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/seperate/GO_BP_results_Down_HFD.csv")
+```
+#limb morphogenesis: Acd/Aldh1a2/Asph/Atrx/Bak1/Bax/Bcl2l11/Bmp4/Bmpr1a/Cacna1c/Col2a1/Col3a1/Cplane1/Ctnnb1/Ece1/Ext1/Fbn2/Fbxw4/Fgf9/Fgfr1/Fgfr2/Flvcr1/Fras1/Frem2/Fuz/Gas1/Gna12/Gnas/Hand2/Hdac1/Hdac2/Hoxa10/Hoxa11/Hoxa9/Hoxc10/Ift140/Ift88/Ihh/Intu/Iqce/Large1/Lmbr1/Lmx1b/Lrp4/Lrp6/Mbnl1/Med1/Megf8/Msx2/Nfia/Nog/Notch1/Notch2/Npr2/Osr1/Pbx1/Pcsk5/Pitx1/Pitx2/Pkdcc/Plxna2/Prickle1/Prrx1/Psen1/Ptch1/Rarb/Rdh10/Ror2/Runx2/Sall3/Sema3c/Sfrp2/Shox2/Sik3/Ski/Tbc1d32/Tbx2/Tbx3/Tgfb2/Tmem231/Ttbk2/Tulp3/Twist1/Zfp219
+#muscle differentiation: Acadm/Acta1/Actc1/Actg1/Actn2/Actn3/Actn4/Acvr1/Adamts15/Adamts5/Afg3l2/Agtr2/Akap13/Akap6/Akt1/Alpk3/Ank2/Ankrd17/Aplnr/Arrb2/Atg7/AW551984/Barx2/Bcl2/Bcl9/Bin1/Bin3/Bmp2/Bmp4/Bmpr1a/Bmpr2/Cacna1s/Camk1/Camk2d/Capn2/Casq2/Ccn4/Ccnd2/Cd81/Cd9/Cdh2/Cdk9/Cdon/Cfl2/Chrnb1/Chuk/Col14a1/Csrp3/Ctdp1/Ctnnb1/Cxadr/Cxcl12/Daxx/Dmpk/Dock1/Dyrk1b/Dysf/Ednra/Ednrb/Efemp2/Efnb2/Ehd1/Ehd2/Ep300/Fdps/Fgf9/Fgfr2/Fkrp/Fktn/Flii/Flnc/Foxp1/Frs2/G6pd2/G6pdx/Glmn/Gsk3a/Gsk3b/H3f3a/H3f3b/Hacd1/Hand2/Hdac2/Hdac4/Hdac5/Hdgfl2/Hes1/Homer1/Id2/Ift88/Igf1/Igf2/Igfbp5/Isl1/Itga8/Itgb1/Kdm6b/Kit/Klhl40/Klhl41/Kras/Krt8/Lamb1/Lamb2/Lamc1/Large1/Lmna/Lmod3/Lox/Maml1/Mamstr/Map2k4/Mapk14/Mdm2/Mecp2/Mef2a/Mef2c/Megf10/Meis1/Met/Mfn2/Mmp14/Mrtfa/Mtor/Myc/Myh10/Myh7/Myh9/Myl9/Mylk2/Mymk/Mymx/Myo18b/Myod1/Myof/Myog/Myom2/Myoz2/Neb/Neo1/Nfatc1/Nfatc4/Nid1/Ninj1/Notch1/Npnt/Nr3c1/Nrg1/Ntf3/Ntn3/Olfm2/Parp2/Pbrm1/Pdcd4/Pdgfb/Pdgfra/Pdgfrb/Pdlim5/Pgm5/Pias1/Piezo1/Pin1/Pitx2/Pld3/Plec/Pmp22/Popdc2/Ppp3ca/Prickle1/Prkar1a/Prkd1/Prok2/Ptgfrn/Rarb/Rbm10/Rbm24/Rbm38/Rbm4/Rbpj/Rcan1/Rxra/Rxrb/Selenon/Setd3/Sgcb/Sgcd/Shox2/Sik1/Sirt1/Sirt6/Six1/Six4/Ski/Slc25a4/Slc8a1/Slc9a1/Smad1/Smad6/Smarca2/Smarcd3/Smo/Smyd1/Sod2/Sorbs2/Sort1/Sox6/Spag9/Speg/Spg11/Srf/Stac3/Stim1/Supt6/Svil/Syne1/Synpo2l/Tarbp2/Tbx1/Tbx2/Tbx3/Tcap/Tgfb1/Tmem119/Tmod1/Tmod2/Tmod3/Tmsb4x/Tmtc3/Tnnt1/Tnnt2/Tnnt3/Tnpo2/Tpm1/Trim32/Trim72/Trip10/Tshz3/Ttn/Uchl1/Vangl2/Vegfa/Wfikkn2/Wt1/Xbp1/Yy1/Zbed6/Zeb1/Znhit1
+```{r}
+UpGeneOnt_MF <-
+  enrichGO(
+    gene = CT_HFD_up$Gene,
+    OrgDb = "org.Mm.eg.db",
+    keyType = "SYMBOL",
+    ont = "MF")
+
+dotplot(UpGeneOnt_MF, showCategory=30)
+ggsave2("F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/2nd_attempt/figure/GO_down_in_HFD_MF.tiff", width=15, height=15, units = c("in"), dpi = 300)
+
+#barplot(UpGeneOnt_MF,showCategory = 20) + scale_fill_gradient(low = "grey30",
+#high = "grey90",name = "adjusted p-value") +
+#  theme_bw(base_size = 15)
+
+DownGeneOnt_MF <-
+  enrichGO(
+    gene = CT_HFD_down$Gene,
+    OrgDb = "org.Mm.eg.db",
+    keyType = "SYMBOL",
+    ont = "MF")
+
+dotplot(UpGeneOnt_MF, showCategory=30)
+ggsave2("F:/Spatial_seq_raw_data/Gao-072523-394242008/Code/2nd_attempt/figure/GO_down_in_HFD_MF.tiff", width=15, height=15, units = c("in"), dpi = 300)
+
+
+UpGeneOnt_CC <-
+  enrichGO(
+    gene = CT_HFD_up$Gene,
+    OrgDb = "org.Mm.eg.db",
+    keyType = "SYMBOL",
+    ont = "CC")
+barplot(UpGeneOnt_CC,showCategory = 20) + scale_fill_gradient(low = "grey30",
+high = "grey90",name = "adjusted p-value") +
+  theme_bw(base_size = 15)
+
+#dotplot(UpGeneOnt_MF, showCategory=30)
+```
+
+
